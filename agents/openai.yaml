@@ -1,0 +1,4 @@
+interface:
+  display_name: "持仓脱水器 Portfolio Dehydrator"
+  short_description: "诊断重叠风险并重构更有章法的 Web3 持仓"
+  default_prompt: "Use $web3-portfolio-optimizer (持仓脱水器 / Portfolio Dehydrator) to analyze a Web3 portfolio, expose hidden overlap, and generate evidence-based allocation advice using correlation, Sortino, Calmar, and max drawdown."
