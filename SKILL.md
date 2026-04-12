@@ -11,7 +11,7 @@ metadata:
     - pandas
     - numpy
     - scipy
-  repository: https://github.com/REPLACE-ME/web3-portfolio-optimizer-skill
+  repository: https://github.com/Shaozrrr/portfolio-dehydrator-skill
   install:
     type: python
     command: python3 -m pip install -r assets/requirements.txt
