@@ -1,9 +1,9 @@
 ---
 name: web3-portfolio-optimizer
-description: 持仓脱水器 / Portfolio Dehydrator is a Web3 portfolio diagnosis and allocation optimization skill. Use when the user wants Codex to turn a PRD or coding request into a backend or skill script that fetches crypto OHLCV data from OKX with Gate.io, Bybit, and Bitget fallback, diagnoses hidden overlap, compares Sortino, Calmar, and max drawdown, performs constrained SLSQP weight optimization, and emits a Chinese Markdown report with source transparency, data-confidence grading, and real-data-only degradation.
+description: Portfolio Dehydrator is a Web3 portfolio diagnosis and allocation optimization skill. Use it when the user wants Codex to turn a PRD or coding request into a backend or skill script that fetches crypto OHLCV data from OKX with Gate.io, Bybit, and Bitget fallback, diagnoses hidden overlap, compares Sortino, Calmar, and maximum drawdown, performs constrained SLSQP weight optimization, and emits a polished Chinese Markdown report with source transparency, data-confidence grading, and real-data-only degradation.
 license: MIT
 metadata:
-  version: 1.0.2
+  version: 1.0.3
   author: Shaozhaoru
   requires:
     - python3
@@ -18,9 +18,7 @@ metadata:
   env: []
 ---
 
-# 持仓脱水器 / Portfolio Dehydrator
-
-在波动与叙事交织的 Web3 市场里，风险从来不会因为持仓数量变多而自动分散，更多时候，它只是换了一种更隐蔽的方式累积。`持仓脱水器` 以现代投资组合理论为底层框架，结合资产相关性、Sortino、Calmar、最大回撤与严格仓位约束，对组合进行结构化拆解与再配置。它识别冗余暴露，衡量下行性价比，压缩无效波动，把资金从情绪驱动的堆叠中抽离出来，重新分配到更值得承担风险的方向。它给出的不是一份表面的调仓建议，而是一套基于证据、以风险收益效率为核心的配置判断，让组合从“看起来很多”走向“真正有章法”。
+# Portfolio Dehydrator
 
 In Web3, risk does not disappear simply because a portfolio holds more assets; more often, it accumulates in subtler forms beneath the surface. `Portfolio Dehydrator` is built on the discipline of Modern Portfolio Theory, combining asset correlation, Sortino, Calmar, maximum drawdown, and strict allocation constraints to deconstruct and rebuild portfolio structure with precision. It identifies redundant exposure, measures downside-adjusted efficiency, compresses unproductive volatility, and reallocates capital toward positions more worthy of the risk they demand. What it delivers is not a superficial rebalance suggestion, but an evidence-based portfolio judgment rooted in risk-return efficiency, turning a crowded portfolio into a coherent one.
 
@@ -30,7 +28,7 @@ Implement a single-file Python backend for this skill. Produce executable code f
 
 1. Convert the request into code, not a long explanation.
 - Build one clean Python file with all imports, helpers, domain models, optimizer logic, and a callable entry point.
-- If the user explicitly asks for "只输出代码", return only code plus a separate `requirements.txt` block.
+- If the user explicitly asks for "code only", return only code plus a separate `requirements.txt` block.
 
 2. Load the exact delivery contract when needed.
 - Read [references/implementation-spec.md](references/implementation-spec.md) whenever the request includes detailed product requirements, optimization constraints, error-handling rules, or report-format requirements.
@@ -53,8 +51,8 @@ Implement a single-file Python backend for this skill. Produce executable code f
 
 - Normalize token symbols to uppercase and map common spot symbols to `-USDT` or `_USDT` formats as required by the exchange.
 - Treat `USDT`, `USDC`, and `DAI` as stablecoins excluded from the risky-asset covariance matrix, and use `R_f = 0.04`.
-- Treat assets with fewer than 84 four-hour candles as `[高风险盲盒]` and cap them at `0.05`.
-- Mark any pair with Pearson correlation `>= 0.85` as `[风险重叠组]`.
+- Treat assets with fewer than 84 four-hour candles as `[High-Risk Blind Box]` and cap them at `0.05`.
+- Mark any pair with Pearson correlation `>= 0.85` as `[Risk Overlap Group]`.
 - Within each overlap group, penalize or effectively suppress the lower-quality asset based on Sortino, Calmar, and max drawdown instead of letting both assets receive full unconstrained weights.
 - If an asset shows weak downside-adjusted quality or overly deep drawdown in the recent sample, tighten its effective optimization cap below the public hard cap and prefer cash over forcing that asset into a large weight.
 - Use deterministic cap buckets: `BTC` and `ETH` at `0.50`, configured blue-chip whitelist at `0.30`, default long-tail assets at `0.15`, new tokens at `0.05`.
@@ -64,7 +62,7 @@ Implement a single-file Python backend for this skill. Produce executable code f
 
 - Emit professional Chinese Markdown.
 - Default to a client-facing report style: professional but readable for non-quant users.
-- Support product-style input guidance before analysis: the backend directly supports ticker lists and natural-language holdings text such as `我现在 40% BTC、30% ETH、30% USDT`.
+- Support product-style input guidance before analysis: the backend directly supports ticker lists and natural-language holdings text such as `I currently hold 40% BTC, 30% ETH, and 30% USDT`.
 - Treat current weights provided by the user as authoritative for "before vs after" comparison; do not overwrite them with an equal-weight assumption.
 - If no current weights are provided, explicitly state that the report uses equal-weight as the default reference portfolio.
 - Add source transparency and data-confidence grading so the reader can see which exchange supplied each asset, how many candles were available, and whether the sample should be treated as high, medium, or low confidence.
@@ -88,11 +86,10 @@ Implement a single-file Python backend for this skill. Produce executable code f
 
 ## Security Notes
 
-- External requests are limited to public market-data endpoints on `OKX` and `Gate.io`.
+- External requests are limited to public market-data endpoints on `OKX`, `Gate.io`, `Bybit`, and `Bitget`.
 - The bundled backend does not persist portfolio data to disk.
 - No API key or wallet private key is required by the current implementation.
 - If an upstream product accepts screenshots or wallet addresses, preprocess them locally and pass only normalized token symbols and optional weights into this backend.
-- Replace `metadata.repository` with the real GitHub repository URL before publishing to ClawHub.
 
 ---
 
