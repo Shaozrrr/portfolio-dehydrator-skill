@@ -1,9 +1,9 @@
 ---
 name: web3-portfolio-optimizer
-description: 持仓脱水器 / Portfolio Dehydrator is a Web3 portfolio diagnosis and allocation optimization skill. Use when the user wants Codex to turn a PRD or coding request into a backend or skill script that fetches crypto OHLCV data from OKX with Gate.io fallback, diagnoses hidden overlap, compares Sortino, Calmar, and max drawdown, performs constrained SLSQP weight optimization, and emits a Chinese Markdown report with strong mainland-China network resilience and mock-data fallback.
+description: 持仓脱水器 / Portfolio Dehydrator is a Web3 portfolio diagnosis and allocation optimization skill. Use when the user wants Codex to turn a PRD or coding request into a backend or skill script that fetches crypto OHLCV data from OKX with Gate.io, Bybit, and Bitget fallback, diagnoses hidden overlap, compares Sortino, Calmar, and max drawdown, performs constrained SLSQP weight optimization, and emits a Chinese Markdown report with source transparency, data-confidence grading, and real-data-only degradation.
 license: MIT
 metadata:
-  version: 1.0.1
+  version: 1.0.2
   author: Shaozhaoru
   requires:
     - python3
@@ -39,9 +39,9 @@ Implement a single-file Python backend for this skill. Produce executable code f
 3. Implement the four required modules.
 - Input module: accept `tokens: list[str]` and `total_capital: float = 10000`.
 - If the user provides current allocation ratios, use them as the original portfolio baseline; only fall back to equal-weight comparison when no starting weights are supplied.
-- Data module: use OKX first, switch to Gate.io after two consecutive failures, skip K-line fetch for stablecoins, support retries, timeouts, fuzzy ticker handling, and mock-data fallback.
+- Data module: use OKX first, then degrade to Gate.io, Bybit, and Bitget, skip K-line fetch for stablecoins, support retries, timeouts, fuzzy ticker handling, and fail closed without synthetic mock pricing.
 - Quant module: compute 4h return series, annualized return and volatility, correlation matrix, Sortino, Calmar, max drawdown, overlap penalties, and SLSQP optimization with hard caps.
-- Output module: return polished Chinese Markdown with risk overlap warnings, asset efficiency analysis, optimized allocation, and one-line optimization impact.
+- Output module: return polished Chinese Markdown with risk overlap warnings, asset efficiency analysis, source-transparency tables, stress testing, optimized allocation, and one-line optimization impact.
 
 4. Preserve production behavior.
 - Use `requests`, `pandas`, `numpy`, and `scipy.optimize`.
@@ -67,13 +67,14 @@ Implement a single-file Python backend for this skill. Produce executable code f
 - Support product-style input guidance before analysis: the backend directly supports ticker lists and natural-language holdings text such as `我现在 40% BTC、30% ETH、30% USDT`.
 - Treat current weights provided by the user as authoritative for "before vs after" comparison; do not overwrite them with an equal-weight assumption.
 - If no current weights are provided, explicitly state that the report uses equal-weight as the default reference portfolio.
+- Add source transparency and data-confidence grading so the reader can see which exchange supplied each asset, how many candles were available, and whether the sample should be treated as high, medium, or low confidence.
 - If the surrounding product accepts screenshots or wallet / address input from Ethereum, BNB Chain, Arbitrum, Base, Optimism, Polygon, Avalanche, Solana, or Tron, convert those holdings into token symbols before calling this backend.
 - Include concrete percentages and `USDT` amounts based on `total_capital`.
 - Add an executive summary, plain-language explanations, and actionable rebalancing guidance instead of only listing raw metrics.
 - Keep technical indicators, but immediately explain what they mean in everyday language when the audience is not explicitly technical.
 - Compare the optimized portfolio against the active reference portfolio: use the user-supplied starting allocation when available, otherwise fall back to equal-weight.
 - Distinguish high-conviction adds from low-confidence or constraint-driven holdings so customer-facing wording stays aligned with the actual quantitative scores.
-- Never crash on bad tickers, rate limits, or full API outage. Degrade gracefully and keep partial analysis.
+- Never crash on bad tickers, rate limits, or full API outage. Degrade gracefully by skipping unavailable assets or returning a cash-only recommendation; do not invent synthetic price paths.
 - When the user requests deliverable code, do not add explanatory prose outside the requested code blocks.
 
 ## Resources
@@ -82,7 +83,7 @@ Implement a single-file Python backend for this skill. Produce executable code f
 - [references/implementation-spec.md](references/implementation-spec.md): PRD-derived contract covering data windows, annualization, fallback behavior, optimization constraints, and report structure.
 
 ### assets/
-- [assets/web3_portfolio_optimizer.py](assets/web3_portfolio_optimizer.py): bundled single-file Python implementation with OKX/Gate.io fallback, mock-data degradation, SLSQP optimization, and Chinese Markdown reporting.
+- [assets/web3_portfolio_optimizer.py](assets/web3_portfolio_optimizer.py): bundled single-file Python implementation with OKX/Gate.io fallback, real-data-only degradation, SLSQP optimization, and Chinese Markdown reporting.
 - [assets/requirements.txt](assets/requirements.txt): minimal dependency list for the bundled Python implementation.
 
 ## Security Notes

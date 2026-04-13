@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import difflib
-import hashlib
 import math
 import re
 import time
@@ -25,21 +24,29 @@ OKX_BASE_URLS: tuple[str, ...] = (
     "https://www.okx.com",
 )
 GATE_API_BASE_URL = "https://api.gateio.ws/api/v4"
+BYBIT_API_BASE_URL = "https://api.bybit.com"
+BITGET_API_BASE_URL = "https://api.bitget.com"
 OKX_KLINE_ENDPOINT = "/api/v5/market/candles"
 GATE_KLINE_ENDPOINT = "/spot/candlesticks"
+BYBIT_KLINE_ENDPOINT = "/v5/market/kline"
+BITGET_KLINE_ENDPOINT = "/api/v2/spot/market/candles"
 REQUEST_TIMEOUT_SECONDS = 6
 REQUEST_RETRY_COUNT = 3
 REQUEST_BACKOFF_SECONDS = 0.8
 CANDLE_INTERVAL_OKX = "4H"
 CANDLE_INTERVAL_GATE = "4h"
+CANDLE_INTERVAL_BYBIT = "240"
+CANDLE_INTERVAL_BITGET = "4h"
 LOOKBACK_DAYS = 30
 CANDLE_LIMIT = 180
 PERIODS_PER_YEAR = 6 * 365  # 4 小时频率，一年约 6 * 365 个周期
 RISK_FREE_RATE = 0.04
 HIGH_CORRELATION_THRESHOLD = 0.85
 NEW_TOKEN_MIN_CANDLES = 84  # 14 天 * 6 根/天
-MIN_USABLE_CANDLES = 20
-MIN_ALIGNMENT_POINTS = 20
+MID_SAMPLE_MIN_CANDLES = 36
+MIN_USABLE_CANDLES = 12
+MIN_ALIGNMENT_POINTS = 12
+STRONG_ALIGNMENT_POINTS = 20
 NUMERICAL_EPSILON = 1e-10
 DOMINATED_ASSET_MAX_WEIGHT = 0.02
 OVERLAP_WEIGHT_PENALTY = 0.20
@@ -126,7 +133,6 @@ class AssetData:
     source: str
     is_new: bool = False
     is_stablecoin: bool = False
-    used_mock: bool = False
     warnings: List[str] = field(default_factory=list)
 
 
@@ -142,7 +148,6 @@ class AssetStats:
     effective_cap: float
     data_points: int
     is_new: bool
-    used_mock: bool
     source: str
 
 
@@ -170,6 +175,15 @@ class ReferencePortfolio:
     sortino: float
     calmar: float
     max_drawdown: float
+
+
+@dataclass
+class StressScenarioResult:
+    name: str
+    assumption: str
+    portfolio_impact: float
+    largest_drag_token: str
+    largest_drag_impact: float
 
 
 def normalize_token(token: str) -> str:
@@ -316,6 +330,28 @@ def _compute_calmar_ratio(annual_return: float, max_drawdown: float) -> float:
     return float((annual_return - RISK_FREE_RATE) / max_drawdown)
 
 
+def sample_band(data_points: int) -> str:
+    """根据 K 线数量给样本打分层标签。"""
+    if data_points >= NEW_TOKEN_MIN_CANDLES:
+        return "完整样本"
+    if data_points >= MID_SAMPLE_MIN_CANDLES:
+        return "偏短样本"
+    if data_points >= MIN_USABLE_CANDLES:
+        return "短样本"
+    return "不足样本"
+
+
+def data_confidence_label(data_points: int) -> Tuple[str, str]:
+    """把样本长度翻译成客户能理解的数据置信度。"""
+    if data_points >= NEW_TOKEN_MIN_CANDLES:
+        return "A", "高"
+    if data_points >= MID_SAMPLE_MIN_CANDLES:
+        return "B", "中"
+    if data_points >= MIN_USABLE_CANDLES:
+        return "C", "低"
+    return "D", "极低"
+
+
 def deduplicate_messages(messages: Sequence[str]) -> List[str]:
     """按原顺序去重，避免报告中重复提示。"""
     seen: set[str] = set()
@@ -351,6 +387,11 @@ def looks_like_missing_instrument(message: str) -> bool:
         "invalid instid",
         "instrument doesn't exist",
         "currency pair",
+        "invalid symbol",
+        "symbol",
+        "symbol not exists",
+        "parameter verification failed",
+        "product not found",
     )
     return any(pattern in normalized for pattern in patterns)
 
@@ -383,6 +424,7 @@ class Web3PortfolioOptimizer:
         warnings: List[str] = []
         explicit_stables = [token for token in normalized_tokens if token in STABLECOINS]
         risky_assets: List[AssetData] = []
+        skipped_assets: Dict[str, str] = {}
 
         for token in normalized_tokens:
             if token in STABLECOINS:
@@ -393,15 +435,16 @@ class Web3PortfolioOptimizer:
                 asset = self._fetch_asset_data(token)
                 risky_assets.append(asset)
                 warnings.extend(asset.warnings)
+            except DataSourceUnavailableError as exc:
+                warnings.append(str(exc))
+                skipped_assets[token] = str(exc)
             except TokenNotFoundError as exc:
                 warnings.append(str(exc))
+                skipped_assets[token] = str(exc)
             except Exception as exc:  # noqa: BLE001
-                mock_asset = self._build_mock_asset(token)
-                mock_asset.warnings.append(
-                    f"{token} 抓取过程中出现未预期异常：{exc}；已改用 Mock Data 保证流程可演示。"
-                )
-                risky_assets.append(mock_asset)
-                warnings.extend(mock_asset.warnings)
+                message = f"{token} 抓取过程中出现未预期异常：{exc}；该资产已跳过，当前版本不会使用 Mock Data。"
+                warnings.append(message)
+                skipped_assets[token] = message
 
         cash_symbol = explicit_stables[0] if explicit_stables else "USDT"
 
@@ -410,19 +453,42 @@ class Web3PortfolioOptimizer:
                 cash_symbol=cash_symbol,
                 total_capital=total_capital,
                 warnings=warnings,
+                skipped_assets=skipped_assets,
             )
 
-        risky_assets = self._ensure_minimum_series_quality(risky_assets, warnings)
+        risky_assets = self._ensure_minimum_series_quality(risky_assets, warnings, skipped_assets)
+        if not risky_assets:
+            return self._format_cash_only_report(
+                cash_symbol=cash_symbol,
+                total_capital=total_capital,
+                warnings=warnings,
+                skipped_assets=skipped_assets,
+            )
+
         stats_map = {asset.token: self._compute_asset_stats(asset) for asset in risky_assets}
-        aligned_prices = self._build_aligned_price_frame(risky_assets, warnings)
+        aligned_prices = self._build_aligned_price_frame(risky_assets, warnings, skipped_assets)
+        if aligned_prices.empty or aligned_prices.shape[1] == 0:
+            warnings.append("风险资产的真实时间序列无法形成有效对齐，本次不启用 Mock Data，已转为现金建议。")
+            return self._format_cash_only_report(
+                cash_symbol=cash_symbol,
+                total_capital=total_capital,
+                warnings=warnings,
+                skipped_assets=skipped_assets,
+            )
+
+        available_tokens = list(aligned_prices.columns)
+        risky_assets = [asset for asset in risky_assets if asset.token in available_tokens]
+        stats_map = {token: stats_map[token] for token in available_tokens}
         returns_frame = aligned_prices.pct_change(fill_method=None).dropna(how="any")
 
         if returns_frame.empty or returns_frame.shape[0] < MIN_ALIGNMENT_POINTS:
-            warnings.append("资产共同有效样本不足，已切换为统一 Mock 对齐数据以完成组合求解。")
-            risky_assets = [self._build_mock_asset(asset.token) for asset in risky_assets]
-            stats_map = {asset.token: self._compute_asset_stats(asset) for asset in risky_assets}
-            aligned_prices = self._build_aligned_price_frame(risky_assets, warnings)
-            returns_frame = aligned_prices.pct_change(fill_method=None).dropna(how="any")
+            warnings.append("资产共同有效样本不足，当前版本不会启用 Mock Data，暂不输出风险资产优化结果。")
+            return self._format_cash_only_report(
+                cash_symbol=cash_symbol,
+                total_capital=total_capital,
+                warnings=warnings,
+                skipped_assets=skipped_assets,
+            )
 
         risky_tokens = [asset.token for asset in risky_assets]
         returns_frame = returns_frame[risky_tokens]
@@ -483,43 +549,56 @@ class Web3PortfolioOptimizer:
             total_capital=total_capital,
             cash_symbol=cash_symbol,
             warnings=final_warnings,
+            skipped_assets=skipped_assets,
         )
 
     def _fetch_asset_data(self, token: str) -> AssetData:
-        """优先从 OKX 抓取；连续失败两次后自动降级到 Gate.io。"""
+        """优先从 OKX 抓取；必要时降级到 Gate.io、Bybit、Bitget。"""
         okx_failures = 0
-        okx_not_found = False
+        attempted_sources: List[str] = ["OKX"]
+        not_found_sources: set[str] = set()
+        unavailable_reasons: List[str] = []
 
         for base_url in OKX_BASE_URLS:
             try:
                 asset = self._fetch_okx_candles(token, base_url)
                 return asset
             except TokenNotFoundError:
-                okx_not_found = True
+                not_found_sources.add("OKX")
                 break
-            except DataSourceUnavailableError:
+            except DataSourceUnavailableError as exc:
                 okx_failures += 1
+                unavailable_reasons.append(f"OKX: {exc}")
                 if okx_failures >= 2:
                     break
 
-        try:
-            asset = self._fetch_gate_candles(token)
-            if okx_failures >= 2:
-                asset.warnings.append(f"{token} 的 OKX 节点短暂波动，系统已自动切换到 Gate.io 并完成分析。")
-            return asset
-        except TokenNotFoundError:
+        fallback_fetchers = (
+            ("Gate.io", self._fetch_gate_candles),
+            ("Bybit", self._fetch_bybit_candles),
+            ("Bitget", self._fetch_bitget_candles),
+        )
+        for source_name, fetcher in fallback_fetchers:
+            attempted_sources.append(source_name)
+            try:
+                asset = fetcher(token)
+                if okx_failures >= 2 or "OKX" in not_found_sources:
+                    asset.warnings.append(
+                        f"{token} 的主数据源不可用，系统已自动切换到 {source_name} 并完成分析。"
+                    )
+                return asset
+            except TokenNotFoundError:
+                not_found_sources.add(source_name)
+            except DataSourceUnavailableError as exc:
+                unavailable_reasons.append(f"{source_name}: {exc}")
+
+        if set(attempted_sources) == not_found_sources:
             suggestion = self._build_unknown_token_warning(token)
             raise TokenNotFoundError(suggestion)
-        except DataSourceUnavailableError as exc:
-            if okx_not_found:
-                suggestion = self._build_unknown_token_warning(token)
-                raise TokenNotFoundError(suggestion)
 
-            mock_asset = self._build_mock_asset(token)
-            mock_asset.warnings.append(
-                f"{token} 的 OKX 与 Gate.io 均不可用（{exc}），已自动启用 Mock Data 继续演示优化逻辑。"
-            )
-            return mock_asset
+        reason_text = "；".join(unavailable_reasons[-3:]) if unavailable_reasons else "外部行情源均不可用"
+        raise DataSourceUnavailableError(
+            f"{token} 的外部行情源暂不可用（{reason_text}），该资产已跳过；当前版本不会使用 Mock Data。"
+        )
 
     def _fetch_okx_candles(self, token: str, base_url: str) -> AssetData:
         """从 OKX 抓取 30 天 4H K 线。"""
@@ -574,6 +653,61 @@ class Web3PortfolioOptimizer:
             raise TokenNotFoundError(token)
 
         return self._parse_gate_candles(token=token, candles=payload)
+
+    def _fetch_bybit_candles(self, token: str) -> AssetData:
+        """从 Bybit 抓取 30 天 4H K 线。"""
+        payload = self._request_json(
+            url=f"{BYBIT_API_BASE_URL}{BYBIT_KLINE_ENDPOINT}",
+            params={
+                "category": "spot",
+                "symbol": f"{token}USDT",
+                "interval": CANDLE_INTERVAL_BYBIT,
+                "limit": str(CANDLE_LIMIT),
+            },
+        )
+
+        if not isinstance(payload, dict):
+            raise DataSourceUnavailableError("Bybit 返回结构异常")
+
+        ret_code = int(payload.get("retCode", 0))
+        if ret_code != 0:
+            message = str(payload.get("retMsg", "Bybit 返回错误"))
+            if looks_like_missing_instrument(message):
+                raise TokenNotFoundError(token)
+            raise DataSourceUnavailableError(message)
+
+        candles = payload.get("result", {}).get("list", [])
+        if not candles:
+            raise TokenNotFoundError(token)
+
+        return self._parse_bybit_candles(token=token, candles=candles)
+
+    def _fetch_bitget_candles(self, token: str) -> AssetData:
+        """从 Bitget 抓取 30 天 4H K 线。"""
+        payload = self._request_json(
+            url=f"{BITGET_API_BASE_URL}{BITGET_KLINE_ENDPOINT}",
+            params={
+                "symbol": f"{token}USDT",
+                "granularity": CANDLE_INTERVAL_BITGET,
+                "limit": str(CANDLE_LIMIT),
+            },
+        )
+
+        if not isinstance(payload, dict):
+            raise DataSourceUnavailableError("Bitget 返回结构异常")
+
+        code = str(payload.get("code", ""))
+        if code and code != "00000":
+            message = str(payload.get("msg", "Bitget 返回错误"))
+            if looks_like_missing_instrument(message):
+                raise TokenNotFoundError(token)
+            raise DataSourceUnavailableError(message)
+
+        candles = payload.get("data", [])
+        if not candles:
+            raise TokenNotFoundError(token)
+
+        return self._parse_bitget_candles(token=token, candles=candles)
 
     def _request_json(self, url: str, params: Dict[str, str]) -> Any:
         """公共 GET 包装器，带超时、限流重试和指数退避。"""
@@ -714,46 +848,107 @@ class Web3PortfolioOptimizer:
             warnings=warnings,
         )
 
-    def _build_mock_asset(self, token: str) -> AssetData:
-        """当真实 API 完全不可用时，生成可重复的模拟价格路径。"""
-        target_index = self._target_index()
-        seed = int(hashlib.sha256(token.encode("utf-8")).hexdigest()[:8], 16)
-        rng = np.random.default_rng(seed)
+    def _parse_bybit_candles(self, token: str, candles: Sequence[Sequence[Any]]) -> AssetData:
+        """解析 Bybit 蜡烛图数据。"""
+        frame = pd.DataFrame(
+            candles,
+            columns=["timestamp_ms", "open", "high", "low", "close", "volume", "turnover"],
+        )
+        frame["timestamp_ms"] = pd.to_numeric(frame["timestamp_ms"], errors="coerce")
+        frame["timestamp"] = pd.to_datetime(frame["timestamp_ms"], unit="ms", utc=True).dt.floor("4h")
+        frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+        frame["volume"] = pd.to_numeric(frame["volume"], errors="coerce")
+        frame = frame.dropna(subset=["timestamp", "close"]).sort_values("timestamp")
+        frame = frame.drop_duplicates(subset=["timestamp"], keep="last")
 
-        base_price = float(10 ** rng.uniform(-1.0, 3.0))
-        drift = float(rng.uniform(-0.0004, 0.0012))
-        volatility = float(rng.uniform(0.01, 0.06))
-        raw_returns = rng.normal(loc=drift, scale=volatility, size=len(target_index))
-        bounded_returns = np.clip(raw_returns, -0.35, 0.35)
-        prices = base_price * np.cumprod(1 + bounded_returns)
-        volumes = rng.lognormal(mean=13.0, sigma=0.8, size=len(target_index))
+        prices = pd.Series(frame["close"].to_numpy(dtype=float), index=frame["timestamp"], name=token)
+        volumes = pd.Series(frame["volume"].fillna(0.0).to_numpy(dtype=float), index=frame["timestamp"], name=token)
+        is_new = prices.shape[0] < NEW_TOKEN_MIN_CANDLES
+
+        if prices.shape[0] < 2:
+            raise DataSourceUnavailableError("Bybit 返回的有效 K 线数量不足")
+
+        warnings: List[str] = []
+        if is_new:
+            warnings.append(f"{token} 上线时间较短，已标记为 [高风险盲盒]，单币权重上限锁定为 5%。")
 
         return AssetData(
             token=token,
-            prices=pd.Series(prices, index=target_index, name=token),
-            volumes=pd.Series(volumes, index=target_index, name=token),
-            source="Mock",
-            is_new=False,
-            used_mock=True,
-            warnings=[],
+            prices=prices,
+            volumes=volumes,
+            source="Bybit",
+            is_new=is_new,
+            warnings=warnings,
+        )
+
+    def _parse_bitget_candles(self, token: str, candles: Sequence[Sequence[Any]]) -> AssetData:
+        """解析 Bitget 蜡烛图数据。"""
+        normalized_rows: List[Dict[str, Any]] = []
+        for candle in candles:
+            if not isinstance(candle, (list, tuple)) or len(candle) < 6:
+                continue
+            normalized_rows.append(
+                {
+                    "timestamp_ms": candle[0],
+                    "open": candle[1],
+                    "high": candle[2],
+                    "low": candle[3],
+                    "close": candle[4],
+                    "volume": candle[5],
+                }
+            )
+
+        frame = pd.DataFrame(normalized_rows)
+        if frame.empty:
+            raise DataSourceUnavailableError("Bitget 返回的 K 线字段不完整")
+
+        frame["timestamp_ms"] = pd.to_numeric(frame["timestamp_ms"], errors="coerce")
+        frame["timestamp"] = pd.to_datetime(frame["timestamp_ms"], unit="ms", utc=True).dt.floor("4h")
+        frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+        frame["volume"] = pd.to_numeric(frame["volume"], errors="coerce")
+        frame = frame.dropna(subset=["timestamp", "close"]).sort_values("timestamp")
+        frame = frame.drop_duplicates(subset=["timestamp"], keep="last")
+
+        prices = pd.Series(frame["close"].to_numpy(dtype=float), index=frame["timestamp"], name=token)
+        volumes = pd.Series(frame["volume"].fillna(0.0).to_numpy(dtype=float), index=frame["timestamp"], name=token)
+        is_new = prices.shape[0] < NEW_TOKEN_MIN_CANDLES
+
+        if prices.shape[0] < 2:
+            raise DataSourceUnavailableError("Bitget 返回的有效 K 线数量不足")
+
+        warnings: List[str] = []
+        if is_new:
+            warnings.append(f"{token} 上线时间较短，已标记为 [高风险盲盒]，单币权重上限锁定为 5%。")
+
+        return AssetData(
+            token=token,
+            prices=prices,
+            volumes=volumes,
+            source="Bitget",
+            is_new=is_new,
+            warnings=warnings,
         )
 
     def _ensure_minimum_series_quality(
-        self, assets: Sequence[AssetData], warnings: List[str]
+        self, assets: Sequence[AssetData], warnings: List[str], skipped_assets: Dict[str, str]
     ) -> List[AssetData]:
-        """样本太少时直接切换到 Mock，避免统计量完全失真。"""
+        """按样本分层处理资产：极少样本跳过，中短样本保留但降置信度。"""
         prepared_assets: List[AssetData] = []
         for asset in assets:
             if asset.prices.shape[0] >= MIN_USABLE_CANDLES:
+                if asset.prices.shape[0] < MID_SAMPLE_MIN_CANDLES:
+                    warnings.append(
+                        f"{asset.token} 当前仅有 {asset.prices.shape[0]} 根可用 K 线，已继续纳入计算，但会按低置信度样本处理。"
+                    )
                 prepared_assets.append(asset)
                 continue
 
-            mock_asset = self._build_mock_asset(asset.token)
-            mock_asset.is_new = asset.is_new or True
-            warnings.append(
-                f"{asset.token} 的可用 K 线少于 {MIN_USABLE_CANDLES} 根，已替换为 Mock Data 以保证统计与优化可执行。"
+            message = (
+                f"{asset.token} 的可用 K 线仅 {asset.prices.shape[0]} 根，低于最小要求 {MIN_USABLE_CANDLES} 根，"
+                "已跳过该资产；当前版本不会使用 Mock Data 补齐。"
             )
-            prepared_assets.append(mock_asset)
+            warnings.append(message)
+            skipped_assets[asset.token] = message
 
         return prepared_assets
 
@@ -784,11 +979,12 @@ class Web3PortfolioOptimizer:
             effective_cap=get_weight_cap(asset.token, asset.is_new),
             data_points=int(asset.prices.shape[0]),
             is_new=asset.is_new,
-            used_mock=asset.used_mock,
             source=asset.source,
         )
 
-    def _build_aligned_price_frame(self, assets: Sequence[AssetData], warnings: List[str]) -> pd.DataFrame:
+    def _build_aligned_price_frame(
+        self, assets: Sequence[AssetData], warnings: List[str], skipped_assets: Dict[str, str]
+    ) -> pd.DataFrame:
         """将多资产价格序列对齐到共同时间轴。"""
         series_list = []
         for asset in assets:
@@ -798,21 +994,37 @@ class Web3PortfolioOptimizer:
             series_list.append(series.rename(asset.token))
 
         inner_frame = pd.concat(series_list, axis=1, join="inner").sort_index()
-        if inner_frame.shape[0] >= MIN_ALIGNMENT_POINTS:
+        if inner_frame.shape[0] >= STRONG_ALIGNMENT_POINTS:
             return inner_frame
 
-        warnings.append("实盘时间轴交集过小，已使用统一 4 小时时间轴做保底对齐。")
-        target_index = self._target_index()
+        warnings.append(
+            "多资产共同时间样本偏少，系统已切换到共享时间窗口做保守对齐；若共同样本仍然不足，结果会转为现金建议。"
+        )
+        start_time = max(pd.Timestamp(asset.prices.index.min()) for asset in assets)
+        end_time = min(pd.Timestamp(asset.prices.index.max()) for asset in assets)
+        if start_time >= end_time:
+            return pd.DataFrame()
+        target_index = pd.date_range(
+            start=start_time.floor("4h"),
+            end=end_time.floor("4h"),
+            freq="4h",
+            tz="UTC",
+        )
         aligned_map: Dict[str, pd.Series] = {}
 
         for asset in assets:
-            reindexed = asset.prices.reindex(target_index).ffill().bfill()
-            if reindexed.isna().any() or reindexed.nunique() < 2:
-                mock_asset = self._build_mock_asset(asset.token)
-                reindexed = mock_asset.prices
+            reindexed = asset.prices.reindex(target_index).ffill(limit=1)
+            usable_points = int(reindexed.dropna().shape[0])
+            if usable_points < MIN_ALIGNMENT_POINTS or reindexed.nunique(dropna=True) < 2:
+                message = f"{asset.token} 在共享时间窗口里的有效样本不足，已从相关性和组合优化阶段跳过。"
+                warnings.append(message)
+                skipped_assets[asset.token] = message
+                continue
             aligned_map[asset.token] = reindexed.rename(asset.token)
 
-        return pd.DataFrame(aligned_map, index=target_index).sort_index()
+        if not aligned_map:
+            return pd.DataFrame(index=target_index)
+        return pd.DataFrame(aligned_map, index=target_index).dropna(how="any").sort_index()
 
     def _detect_overlap_pairs(
         self, correlation_matrix: pd.DataFrame, stats_map: Dict[str, AssetStats]
@@ -846,8 +1058,6 @@ class Web3PortfolioOptimizer:
         effective_cap = stats.cap
         if token in dominated_tokens:
             effective_cap = min(effective_cap, DOMINATED_ASSET_MAX_WEIGHT)
-        if stats.used_mock:
-            effective_cap = min(effective_cap, 0.05)
         if stats.max_drawdown >= 0.70:
             effective_cap = min(effective_cap, DEEP_DRAWDOWN_MAX_WEIGHT)
         elif stats.sortino < 0 and stats.calmar < 0:
@@ -1177,6 +1387,77 @@ class Web3PortfolioOptimizer:
         top_corr = float(token_correlations.loc[top_peer])
         return top_peer, top_corr
 
+    def _data_confidence_for_stats(self, stats: AssetStats) -> Tuple[str, str]:
+        """把样本量翻译成报告里的数据置信度标签。"""
+        return data_confidence_label(stats.data_points)
+
+    def _sample_treatment_text(self, stats: AssetStats) -> str:
+        """解释该资产在样本分层里的处理方式。"""
+        band = sample_band(stats.data_points)
+        if band == "完整样本":
+            return "按标准样本处理"
+        if band == "偏短样本":
+            return "已纳入计算，但按新币/偏短样本保守处理"
+        return "已纳入计算，但仅作低置信度参考"
+
+    def _build_stress_scenarios(
+        self, risky_tokens: Sequence[str], optimization: OptimizationResult, cash_symbol: str
+    ) -> List[StressScenarioResult]:
+        """构造简单但客户容易理解的组合压力测试。"""
+
+        def shock_for_token(token: str, scenario: str) -> float:
+            if token == "XAUT":
+                if scenario == "避险轮动":
+                    return 0.04
+                if scenario == "大盘同步回撤":
+                    return -0.03
+                return -0.01
+            if token in MEGA_CAP_TOKENS:
+                return {
+                    "大盘同步回撤": -0.15,
+                    "山寨流动性挤兑": -0.08,
+                    "避险轮动": -0.10,
+                }[scenario]
+            if token in BLUE_CHIP_TOKENS:
+                return {
+                    "大盘同步回撤": -0.20,
+                    "山寨流动性挤兑": -0.16,
+                    "避险轮动": -0.14,
+                }[scenario]
+            return {
+                "大盘同步回撤": -0.28,
+                "山寨流动性挤兑": -0.35,
+                "避险轮动": -0.22,
+            }[scenario]
+
+        scenario_assumptions = {
+            "大盘同步回撤": "假设主流资产普遍回落、长尾资产跌幅更深，稳定币不受冲击。",
+            "山寨流动性挤兑": "假设市场先抛售流动性较弱的长尾仓位，主流币相对抗跌。",
+            "避险轮动": "假设风险偏好下降，资金从加密风险资产流向稳定币与部分避险资产。",
+        }
+        scenario_results: List[StressScenarioResult] = []
+        for scenario_name, assumption in scenario_assumptions.items():
+            token_impacts: Dict[str, float] = {}
+            for token in risky_tokens:
+                token_impacts[token] = optimization.weights.get(token, 0.0) * shock_for_token(token, scenario_name)
+            portfolio_impact = float(sum(token_impacts.values()))
+            largest_drag_token = "-"
+            largest_drag_impact = 0.0
+            if token_impacts:
+                largest_drag_token, largest_drag_impact = min(token_impacts.items(), key=lambda item: item[1])
+            if optimization.cash_weight > 0:
+                portfolio_impact += optimization.cash_weight * 0.0
+            scenario_results.append(
+                StressScenarioResult(
+                    name=scenario_name,
+                    assumption=assumption,
+                    portfolio_impact=portfolio_impact,
+                    largest_drag_token=largest_drag_token if largest_drag_token != cash_symbol else cash_symbol,
+                    largest_drag_impact=largest_drag_impact,
+                )
+            )
+        return scenario_results
+
     def _grade_asset(
         self,
         token: str,
@@ -1215,7 +1496,7 @@ class Web3PortfolioOptimizer:
             score -= 1
         if stats.is_new:
             score -= 1
-        if stats.used_mock:
+        if stats.data_points < MID_SAMPLE_MIN_CANDLES:
             score -= 1
         if weight <= 0.001:
             score = min(score, 0)
@@ -1297,6 +1578,8 @@ class Web3PortfolioOptimizer:
             action += " 由于与更高效率资产高度重叠，这个仓位需要被严格控制。"
         if stats.max_drawdown >= 0.55:
             action += " 最近样本中的最大回撤偏深，需要把底线风险放在第一位。"
+        if stats.data_points < MID_SAMPLE_MIN_CANDLES:
+            action += " 当前可用样本偏短，相关性和效率判断应按低置信度理解。"
         if stats.sortino < 0 or stats.calmar < 0:
             action += " 从最近样本看，它的下行性价比并不理想。"
         elif stats.sortino >= 2 and stats.calmar >= 1:
@@ -1341,6 +1624,7 @@ class Web3PortfolioOptimizer:
         total_capital: float,
         cash_symbol: str,
         warnings: Sequence[str],
+        skipped_assets: Dict[str, str],
     ) -> str:
         """将量化结果格式化为专业中文 Markdown。"""
         baseline_return = reference_portfolio.expected_return
@@ -1421,10 +1705,35 @@ class Web3PortfolioOptimizer:
 
         lines.append("## 1. 数据口径与方法披露")
         lines.append("- 数据窗口：最近 `30 天`、`4 小时` K 线，稳定币不进入波动率矩阵，仅作为无风险基准。")
-        lines.append("- 数据来源：优先 `OKX`，必要时降级 `Gate.io`；若双源失效，会显式提示并启用 Mock Data。")
+        lines.append("- 数据来源：优先 `OKX`，必要时降级 `Gate.io`、`Bybit`、`Bitget`；若外部源均失效，会显式提示并跳过该资产，不使用 Mock Data。")
         lines.append("- 方法框架：先看相关性，再看单资产 Sortino / Calmar / 最大回撤，最后在权重上限约束下做 SLSQP 优化。")
         lines.append("- 约束规则：`BTC/ETH` 单币上限 `50%`，蓝筹资产上限 `30%`，长尾资产上限 `15%`，新币上限 `5%`。")
         lines.append("- 解释口径：Sortino 越高代表下行风险调整后的性价比越好，Calmar 越高代表收益与回撤更划算，最大回撤越低越稳。")
+        lines.append("- 时间轴对齐：只有各资产在同一个 4 小时时间点上都存在真实价格时，相关性与优化结果才可靠；如果“大家都能同时比较”的样本太少，系统会降低置信度，严重不足时改为现金建议。")
+        lines.append("")
+
+        lines.append("### 数据来源与样本透明度")
+        source_headers = ["资产", "数据源", "可用K线", "样本分层", "数据置信度", "处理方式"]
+        source_rows: List[List[str]] = []
+        for token in risky_tokens:
+            stats = stats_map[token]
+            confidence_grade, confidence_label = self._data_confidence_for_stats(stats)
+            source_rows.append(
+                [
+                    f"`{token}`",
+                    stats.source,
+                    str(stats.data_points),
+                    sample_band(stats.data_points),
+                    f"{confidence_grade} / {confidence_label}",
+                    self._sample_treatment_text(stats),
+                ]
+            )
+        lines.extend(self._format_markdown_table(source_headers, source_rows))
+        if skipped_assets:
+            lines.append("")
+            lines.append("### 本次被跳过的资产")
+            for token, reason in skipped_assets.items():
+                lines.append(f"- `{token}`：{reason}")
         lines.append("")
 
         lines.append("## 2. 相关性与重叠诊断")
@@ -1451,6 +1760,8 @@ class Web3PortfolioOptimizer:
             "最大回撤",
             "年化收益",
             "年化波动",
+            "数据源",
+            "置信度",
             "建议权重",
             "评级",
         ]
@@ -1469,6 +1780,8 @@ class Web3PortfolioOptimizer:
                     f"{stats.max_drawdown:.2%}",
                     f"{stats.expected_return:.2%}",
                     f"{stats.volatility:.2%}",
+                    stats.source,
+                    "/".join(self._data_confidence_for_stats(stats)),
                     f"{optimization.weights.get(token, 0.0):.2%}",
                     f"{grade_map[token]} / {grade_label_map[token]}",
                 ]
@@ -1523,12 +1836,6 @@ class Web3PortfolioOptimizer:
                 f"- `[高风险盲盒]` 资产：{', '.join(f'`{token}`' for token in blind_boxes)}，"
                 "这些资产因历史样本不足，已被自动施加 5% 上限。"
             )
-        mock_assets = [stats.token for stats in stats_map.values() if stats.used_mock]
-        if mock_assets:
-            lines.append(
-                f"- 使用 Mock Data 的资产：{', '.join(f'`{token}`' for token in mock_assets)}，"
-                "请在真实 API 恢复后重新跑一次，结论会更稳健。"
-            )
         grade_buckets: Dict[str, List[str]] = {"A": [], "B": [], "C": [], "D": []}
         for token in risky_tokens:
             grade_buckets[grade_map[token]].append(f"`{token}`({grade_label_map[token]})")
@@ -1557,7 +1864,8 @@ class Web3PortfolioOptimizer:
             lines.append(
                 f"- `{token}`：定位 `{role}`。当前建议权重 `{weight:.2%}`，年化收益 `{stats.expected_return:.2%}`，"
                 f" 年化波动 `{stats.volatility:.2%}`，Sortino `{stats.sortino:.2f}`，Calmar `{stats.calmar:.2f}`，最大回撤 `{stats.max_drawdown:.2%}`，"
-                f" 与优化组合相关性 `{asset_to_portfolio_corr.get(token, 0.0):.2f}`，综合评级 `{grade_map[token]} / {grade_label_map[token]}`。{action}"
+                f" 与优化组合相关性 `{asset_to_portfolio_corr.get(token, 0.0):.2f}`，数据源 `{stats.source}`，"
+                f" 数据置信度 `{'/'.join(self._data_confidence_for_stats(stats))}`，综合评级 `{grade_map[token]} / {grade_label_map[token]}`。{action}"
             )
         lines.append("")
 
@@ -1661,8 +1969,6 @@ class Web3PortfolioOptimizer:
             tags: List[str] = []
             if stats.is_new:
                 tags.append("高风险盲盒")
-            if stats.used_mock:
-                tags.append("Mock")
             role_text = role if not tags else f"{role} / {' / '.join(tags)}"
             target_rows.append(
                 [
@@ -1720,7 +2026,24 @@ class Web3PortfolioOptimizer:
         lines.extend(step_lines)
         lines.append("")
 
-        lines.append("## 6. 结论与优化效果")
+        lines.append("## 6. 压力测试")
+        lines.append("- 下表不是预测未来，而是用几个常见风险情景去观察：如果市场重新进入压力状态，当前优化后的仓位结构大概会怎么反应。")
+        stress_headers = ["情景", "核心假设", "组合预估影响", "最大拖累资产", "该资产拖累贡献"]
+        stress_rows: List[List[str]] = []
+        for scenario in self._build_stress_scenarios(risky_tokens, optimization, cash_symbol):
+            stress_rows.append(
+                [
+                    scenario.name,
+                    scenario.assumption,
+                    f"{scenario.portfolio_impact:.2%}",
+                    f"`{scenario.largest_drag_token}`" if scenario.largest_drag_token != "-" else "-",
+                    f"{scenario.largest_drag_impact:.2%}",
+                ]
+            )
+        lines.extend(self._format_markdown_table(stress_headers, stress_rows))
+        lines.append("")
+
+        lines.append("## 7. 结论与优化效果")
         volatility_reduction = 0.0
         if baseline_volatility > NUMERICAL_EPSILON:
             volatility_reduction = (baseline_volatility - optimization.volatility) / baseline_volatility * 100.0
@@ -1769,20 +2092,21 @@ class Web3PortfolioOptimizer:
         else:
             lines.append("- 这说明模型接受了更高波动，去换取更好的收益弹性；适合风险承受能力更强的客户。")
         lines.append("")
-        lines.append("## 7. 合规与风险揭示")
+        lines.append("## 8. 合规与风险揭示")
         lines.append("- 本报告属于历史数据驱动的量化分析输出，用于辅助理解组合结构，不构成保证收益的投资承诺。")
         lines.append("- 本模型未接入你的真实财务状况、负债、税务、流动性需求和适当性测评，因此不属于个性化投资顾问服务。")
         lines.append("- 报告默认基于现货视角，不包含杠杆、合约、滑点、手续费、链上冲击成本和极端流动性风险。")
-        lines.append("- 对新币、样本不足资产或启用了 Mock Data 的资产，应降低信任权重，并在真实成交前做额外人工复核。")
+        lines.append("- 对新币、样本不足或数据源异常被跳过的资产，应在真实成交前做额外人工复核。")
         lines.append("- 若面向客户展示，建议同时披露样本窗口、数据来源、策略边界和“历史表现不代表未来”的风险提示。")
         lines.append("")
-        lines.append("## 8. 指标说明")
+        lines.append("## 9. 指标说明")
         lines.append("- `相关系数`：越接近 1，说明两个币越容易一起涨跌；相关性太高时，分散效果会变差。")
         lines.append("- `与组合相关性`：越高说明该资产越像是“主导组合波动”的成员，越低则更像分散化补充。")
         lines.append("- `年化波动率`：可以理解为价格起伏的剧烈程度，越高代表净值上下波动越大。")
         lines.append("- `Sortino`：只惩罚下跌波动，越高代表下行风险调整后的性价比越好。")
         lines.append("- `Calmar`：看收益相对最大回撤是否划算，越高越说明“这份回撤换来的收益更值”。")
         lines.append("- `最大回撤`：观察从阶段高点回落最深有多大，越低越能守住底线。")
+        lines.append("- `数据置信度`：主要由可用 K 线数量决定；样本越完整，结论通常越稳。")
         lines.append("- 风险提示：本报告基于最近 30 天、4 小时级别历史数据，适合做结构优化参考，不代表未来收益承诺。")
 
         return "\n".join(lines)
@@ -1808,7 +2132,11 @@ class Web3PortfolioOptimizer:
         )
 
     def _format_cash_only_report(
-        self, cash_symbol: str, total_capital: float, warnings: Sequence[str]
+        self,
+        cash_symbol: str,
+        total_capital: float,
+        warnings: Sequence[str],
+        skipped_assets: Optional[Dict[str, str]] = None,
     ) -> str:
         """只有稳定币或全部无效代币时的保底输出。"""
         lines = ["# Web3 持仓组合优化报告", ""]
@@ -1816,6 +2144,11 @@ class Web3PortfolioOptimizer:
             lines.append("> 系统提示")
             for warning in deduplicate_messages(warnings):
                 lines.append(f"> - {warning}")
+            lines.append("")
+        if skipped_assets:
+            lines.append("## 数据可用性说明")
+            for token, reason in skipped_assets.items():
+                lines.append(f"- `{token}`：{reason}")
             lines.append("")
 
         lines.extend(

@@ -22,10 +22,18 @@ Use this file when the request asks for exact Portfolio Master behavior or when 
 - Prefer OKX hosts that are more resilient for mainland-China connectivity:
   - `https://aws.okx.com`
   - `https://www.okx.com`
-- After two consecutive OKX failures for the same asset, fall back to Gate.io.
+- After two consecutive OKX failures for the same asset, fall back in order to:
+  - `Gate.io`
+  - `Bybit`
+  - `Bitget`
 - Handle rate limits, timeouts, and malformed responses with retries and bounded backoff.
-- Provide a deterministic mock-data generator so the full optimization pipeline still works when both APIs fail.
+- Do not use synthetic mock price paths in production mode. When both APIs fail, skip the affected asset, keep partial execution when possible, and fall back to a cash-only recommendation if no real-data portfolio can be built.
 - For invalid tickers, use fuzzy suggestions when practical and otherwise return a graceful warning while continuing with valid assets.
+- Use sample-tiering instead of a single hard cut:
+  - fewer than `12` candles: skip the asset
+  - `12-35` candles: keep it in the report and model as a low-confidence short sample
+  - `36-83` candles: keep it as a usable but still incomplete sample
+  - `84+` candles: treat as a standard sample
 
 ## Quant Contract
 
@@ -56,6 +64,8 @@ Output must be a professional Chinese Markdown report with these sections:
   - Layer 2: explain the quant reason in plain Chinese so non-expert clients can still follow the logic.
 - Prefer customer-ready wording over purely internal analyst shorthand.
 - Avoid repeating the same conclusion across adjacent sections; each section should contribute a distinct layer of evidence.
+- Add a source-transparency layer showing data source, candle count, sample band, and data-confidence label for each asset.
+- Add a simple scenario stress test so the report explains how the optimized portfolio behaves under a few downside environments.
 
 Recommended opening block before the numbered sections:
 
